@@ -2,11 +2,10 @@ import pygame
 import random
 import numpy as np
 import onnxruntime as ort
+from openvino.runtime import Core
 import logging
-import scipy.special
 import heapq
 import time
-import threading
 
 # Set up logging
 logging.basicConfig(
@@ -35,7 +34,56 @@ DIRECTIONS = [UP, RIGHT, DOWN, LEFT]
 pygame.init()
 window = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Snake Game with A* and ONNX")
-ort_session = ort.InferenceSession("./onnx/nextMoveSnake.onnx")
+
+openvino_model_path = "./openVino/nextMoveSnake.xml"
+onnx_model_path = "./onnx/nextMoveSnake.onnx"
+
+def compile_model_with_fallback(openvino_model_path, onnx_model_path, devices=['NPU', 'GPU', 'CPU']):
+    core = Core()
+    openvino_model = core.read_model(openvino_model_path)
+    
+    # Try OpenVINO first
+    for device in devices:
+        try:
+            if device in core.available_devices:
+                compiled_model = core.compile_model(openvino_model, device)
+                print(f"OpenVINO model compiled successfully on {device}")
+                return ('openvino', compiled_model, device)
+        except Exception as e:
+            print(f"Failed to compile OpenVINO model on {device}: {str(e)}")
+    
+    # If OpenVINO fails, try ONNX
+    print("Falling back to ONNX model")
+    try:
+        ort_session = ort.InferenceSession(onnx_model_path)
+        print("ONNX model loaded successfully")
+        return ('onnx', ort_session, 'ONNX Runtime')
+    except Exception as e:
+        print(f"Failed to load ONNX model: {str(e)}")
+    
+    raise RuntimeError("Failed to compile/load model with OpenVINO and ONNX")
+
+# Usage
+try:
+    # mo --input_model ./onnx/nextMoveSnake.onnx --output_dir optimized_model
+    model_type, model, used_device = compile_model_with_fallback(openvino_model_path, onnx_model_path)
+    
+    if model_type == 'openvino':
+        # OpenVINO model
+        input_layer = model.input(0)
+        output_layer = model.output(0)
+        print(f"OpenVINO model compiled and running on {used_device}")
+        # Your OpenVINO inference code here...
+    else:
+        # ONNX model
+        input_name = model.get_inputs()[0].name
+        output_name = model.get_outputs()[0].name
+        print(f"ONNX model loaded and running with {used_device}")
+        # Your ONNX inference code here...
+
+except RuntimeError as e:
+    print(f"Error: {str(e)}")
+
 
 class Node:
     def __init__(self, parent=None, position=None):
@@ -100,17 +148,30 @@ class Food:
         pygame.draw.rect(surface, BLACK, r, 1)
 
 def softmax(x):
-    return scipy.special.softmax(x)
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
 
-def get_move_from_onnx(snake, food):
+def get_move_from_model(model_info, snake, food):
     start_time = time.perf_counter_ns()
+    
     head = snake.get_head_position()
-    input_data = np.array([head[0], head[1], food.position[0], food.position[1], snake.length], dtype=np.float32).reshape(1, -1)
+    input_data = np.array([[head[0], head[1], food.position[0], food.position[1], snake.length]], dtype=np.float32)
     
-    ort_inputs = {ort_session.get_inputs()[0].name: input_data}
-    ort_outs = ort_session.run(None, ort_inputs)
+    model_type, model, _ = model_info
     
-    probabilities = softmax(ort_outs[0][0])
+    if model_type == 'openvino':
+        # OpenVINO inference
+        results = model([input_data])[model.output(0)]
+    elif model_type == 'onnx':
+        # ONNX Runtime inference
+        ort_inputs = {model.get_inputs()[0].name: input_data}
+        ort_outs = model.run(None, ort_inputs)
+        results = ort_outs[0]
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
+    
+    # Process results
+    probabilities = softmax(results[0])
     direction_index = np.argmax(probabilities)
     confidence = probabilities[direction_index]
     
@@ -174,12 +235,6 @@ def get_move_from_astar(snake, food):
     duration = time.perf_counter_ns() - start_time
     return move, duration
 
-def get_move_threaded(snake, food, method, result):
-    if method == 'onnx':
-        result['onnx'] = get_move_from_onnx(snake, food)
-    elif method == 'astar':
-        result['astar'] = get_move_from_astar(snake, food)
-
 def game_loop(initial_use_onnx=True):
     clock = pygame.time.Clock()
     screen = pygame.display.set_mode((WIDTH, HEIGHT), 0, 32)
@@ -203,7 +258,10 @@ def game_loop(initial_use_onnx=True):
                     use_onnx = not use_onnx
                     logging.info(f"Switched to {'ONNX' if use_onnx else 'A*'} pathfinding")
 
-        onnx_move, onnx_confidence, onnx_duration = get_move_from_onnx(snake, food)
+        model_info = compile_model_with_fallback(openvino_model_path, onnx_model_path)
+    
+
+        onnx_move, onnx_confidence, onnx_duration = get_move_from_model(model_info, snake, food)
         astar_move, astar_duration = get_move_from_astar(snake, food)
 
         move = onnx_move if use_onnx else astar_move
@@ -244,7 +302,7 @@ def game_loop(initial_use_onnx=True):
 
 def main():
     use_onnx = True
-    logging.info("Starting Snake Game. Press 'T' to toggle between ONNX and A* pathfinding.")
+    logging.info("Press 'T' to toggle between ONNX and A* pathfinding.")
     while True:
         result = game_loop(use_onnx)
         if result == "QUIT":
